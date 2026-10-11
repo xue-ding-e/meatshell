@@ -16,6 +16,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let command = CliCommand::parse(Some(command_name))
         .ok_or_else(|| anyhow!("unknown CLI command: {command_name}"))?;
     let value = match command {
+        CliCommand::McpLimits => mcp_limits(&args[3..])?,
         CliCommand::Import => {
             let path = args
                 .get(3)
@@ -150,6 +151,46 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Read or update only the selected profile. Unknown/duplicate options fail
+/// before loading a store, and all four values are validated before mutation.
+fn parse_mcp_limits(args: &[String], current: crate::config::McpHttpLimits) -> Result<Option<crate::config::McpHttpLimits>> {
+    let mut values = [current.sessions.to_string(), current.requests.to_string(), current.calls.to_string(), current.streams.to_string()];
+    let mut seen = [false; 4];
+    let mut index = 0;
+    let mut json_seen = false;
+    while index < args.len() {
+        if args[index] == "--json" {
+            anyhow::ensure!(!json_seen, "duplicate --json option");
+            json_seen = true;
+            index += 1;
+            continue;
+        }
+        let slot = match args[index].as_str() {
+            "--sessions" => 0, "--requests" => 1, "--calls" => 2, "--streams" => 3,
+            other => anyhow::bail!("unknown mcp-limits option: {other}"),
+        };
+        anyhow::ensure!(!seen[slot], "duplicate {} option", args[index]);
+        seen[slot] = true;
+        values[slot] = args.get(index + 1).context("MCP limit option requires an integer value")?.clone();
+        index += 2;
+    }
+    let limits = crate::config::McpHttpLimits::parse_inputs(&values[0], &values[1], &values[2], &values[3])?;
+    Ok(seen.iter().any(|seen| *seen).then_some(limits))
+}
+
+fn mcp_limits(args: &[String]) -> Result<Value> {
+    // Validate command syntax before creating any profile files.
+    parse_mcp_limits(args, crate::config::McpHttpLimits::default())?;
+    let mut store = crate::config::ConfigStore::load()?;
+    let update = parse_mcp_limits(args, store.mcp_http_limits())?;
+    if let Some(limits) = update {
+        store.set_mcp_http_limits(limits)?;
+        store.save()?;
+    }
+    Ok(json!({"limits": store.mcp_http_limits(), "saved": update.is_some(),
+        "restart_required": update.is_some(), "zero_means_unlimited": true}))
+}
+
 fn option_value<'a>(args: &'a [String], option: &str) -> Result<Option<&'a str>> {
     let Some(index) = args.iter().position(|arg| arg == option) else {
         return Ok(None);
@@ -185,6 +226,10 @@ fn print_human(command: CliCommand, value: &Value) {
                     );
                 }
             }
+        }
+        CliCommand::McpLimits => {
+            println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+            println!("0 = unlimited. Saved limits take effect after restarting the HTTP MCP service.");
         }
         CliCommand::Session => println!(
             "{}",
@@ -238,6 +283,7 @@ fn print_help() {
         "MeatShell CLI\n\n\
          Usage:\n\
            meatshell cli import <export.json> [--dry-run] [--json]\n\
+           meatshell cli mcp-limits [--sessions N] [--requests N] [--calls N] [--streams N] [--json]\n\
            meatshell cli sessions [--group <name>] [--json]\n\
            meatshell cli session <session-id> [--json]\n\
            meatshell cli exec <session-id> [--timeout <seconds>] [--json] -- <command>\n\
@@ -251,6 +297,21 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_limits_options_are_strict_and_preserve_unspecified_fields() {
+        let current = crate::config::McpHttpLimits::parse_inputs("1", "2", "3", "4").unwrap();
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_mcp_limits(&[], current).unwrap(), None);
+        assert_eq!(parse_mcp_limits(&args(&["--json"]), current).unwrap(), None);
+        assert_eq!(parse_mcp_limits(&args(&["--calls", "0", "--json"]), current).unwrap(),
+            Some(crate::config::McpHttpLimits { calls: 0, ..current }));
+        for invalid in [vec!["--calls"], vec!["--unknown", "1"], vec!["--calls", "1", "--calls", "2"],
+            vec!["--json", "--json"], vec!["--requests", "-1"], vec!["--streams", "1.5"],
+            vec!["--sessions", "1000001"], vec!["--calls", "18446744073709551616"]] {
+            assert!(parse_mcp_limits(&args(&invalid), current).is_err(), "accepted {invalid:?}");
+        }
+    }
 
     #[test]
     fn parses_option_values() {

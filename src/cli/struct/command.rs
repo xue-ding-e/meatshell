@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliCommand {
     Sessions,
+    McpLimits,
     Session,
     Import,
     Exec,
@@ -14,6 +15,7 @@ pub(crate) enum CliCommand {
 impl CliCommand {
     pub(crate) fn parse(value: Option<&str>) -> Option<Self> {
         match value.unwrap_or("help") {
+            "mcp-limits" => Some(Self::McpLimits),
             "sessions" => Some(Self::Sessions),
             "session" => Some(Self::Session),
             "import" => Some(Self::Import),

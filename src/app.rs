@@ -949,6 +949,11 @@ fn open_window(
         window.set_mcp_use_saved_credentials(s.mcp_use_saved_credentials());
         window.set_mcp_allow_commands(s.mcp_allow_commands());
         window.set_mcp_allow_file_transfers(s.mcp_allow_file_transfers());
+        let limits = s.mcp_http_limits();
+        window.set_mcp_http_sessions(limits.sessions.to_string().into());
+        window.set_mcp_http_requests(limits.requests.to_string().into());
+        window.set_mcp_http_calls(limits.calls.to_string().into());
+        window.set_mcp_http_streams(limits.streams.to_string().into());
     }
 
     {
@@ -960,6 +965,52 @@ fn open_window(
             settings.set_mcp_allow_commands(commands);
             settings.set_mcp_allow_file_transfers(files);
             let _ = settings.save();
+        });
+    }
+
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        window.on_save_mcp_http_limits(move |sessions, requests, calls, streams| {
+            let Some(window) = weak.upgrade() else { return };
+            let limits = match crate::config::McpHttpLimits::parse_inputs(
+                sessions.as_str(), requests.as_str(), calls.as_str(), streams.as_str(),
+            ) {
+                Ok(limits) => limits,
+                Err(err) => {
+                    window.set_mcp_http_limits_error(true);
+                    window.set_mcp_http_limits_status(format!("{}: {err}", t(
+                        "输入无效：四项均须为 0 至 1000000 的整数；设置未更改",
+                        "Invalid input: all four values must be integers from 0 to 1000000; settings unchanged",
+                    )).into());
+                    return;
+                }
+            };
+            let mut settings = store.borrow_mut();
+            let previous = settings.mcp_http_limits();
+            if let Err(err) = settings.set_mcp_http_limits(limits).and_then(|_| settings.save()) {
+                // Restore the cache as well, otherwise a later unrelated Save
+                // could silently persist limits whose explicit Save failed.
+                let rollback = settings.set_mcp_http_limits(previous);
+                window.set_mcp_http_limits_error(true);
+                let mut message = format!("{}: {err}", t("保存失败", "Save failed"));
+                if let Err(rollback_err) = rollback {
+                    message.push_str(&format!("; {}: {rollback_err}", t(
+                        "恢复原设置失败", "Could not restore previous settings",
+                    )));
+                }
+                window.set_mcp_http_limits_status(message.into());
+                return;
+            }
+            window.set_mcp_http_sessions(limits.sessions.to_string().into());
+            window.set_mcp_http_requests(limits.requests.to_string().into());
+            window.set_mcp_http_calls(limits.calls.to_string().into());
+            window.set_mcp_http_streams(limits.streams.to_string().into());
+            window.set_mcp_http_limits_error(false);
+            window.set_mcp_http_limits_status(t(
+                "已保存。请重启 MCP HTTP 服务以应用新限制。",
+                "Saved. Restart the MCP HTTP service to apply the new limits.",
+            ).into());
         });
     }
 

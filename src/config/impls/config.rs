@@ -1304,6 +1304,15 @@ impl ConfigStore {
     pub fn set_update_check_enabled(&mut self, enabled: bool) {
         self.cache.update_check_disabled = !enabled;
     }
+    pub fn mcp_http_limits(&self) -> McpHttpLimits {
+        self.cache.mcp_http_limits
+    }
+    pub fn set_mcp_http_limits(&mut self, limits: McpHttpLimits) -> Result<()> {
+        limits.validate()?;
+        self.cache.mcp_http_limits = limits;
+        Ok(())
+    }
+
     pub fn mcp_enabled(&self) -> bool {
         self.cache.mcp_enabled
     }
@@ -1665,6 +1674,7 @@ impl ConfigStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        self.cache.mcp_http_limits.validate()?;
         let _lock = lock_config(&self.path)?;
         if read_config_snapshot(&self.path)? != *self.disk_snapshot.borrow() {
             anyhow::bail!("Configuration changed in another process; reload before saving. Existing connections were preserved.");
@@ -1853,6 +1863,24 @@ pub(crate) fn fixture_store(path: PathBuf, sessions: Vec<Session>) -> ConfigStor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_limits_validate_and_persist() {
+        let mut store = temp_store();
+        assert_eq!(store.mcp_http_limits(), McpHttpLimits::default());
+        let limits = McpHttpLimits::parse_inputs("1", "2", "3", "4").unwrap();
+        store.set_mcp_http_limits(limits).unwrap();
+        store.save().unwrap();
+        let persisted: ConfigFile = serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(persisted.mcp_http_limits, limits);
+        assert!(store.set_mcp_http_limits(McpHttpLimits { calls: McpHttpLimits::MAX + 1, ..limits }).is_err());
+        assert_eq!(store.mcp_http_limits(), limits);
+        store.set_mcp_http_limits(McpHttpLimits::default()).unwrap();
+        store.save().unwrap();
+        let persisted: ConfigFile = serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(persisted.mcp_http_limits, McpHttpLimits::default());
+        let _ = fs::remove_file(&store.path);
+    }
 
     pub(super) fn temp_store() -> ConfigStore {
         let path = std::env::temp_dir().join(format!("ms-test-{}.json", Uuid::new_v4()));

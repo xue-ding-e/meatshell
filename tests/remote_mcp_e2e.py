@@ -360,6 +360,330 @@ def main():
             assert 'synthetic-not-a-real-secret' not in output
         print(f'PASS: clean shutdown; no token/credential logging; negotiated MCP {args.protocol_version}')
 
+        # Keep each admission test on a fresh service. Limits are deliberately
+        # independent so a refusal proves the named gate, not an earlier gate.
+        limit_names = ('sessions', 'requests', 'calls', 'streams')
+        unlimited = dict.fromkeys(limit_names, 0)
+
+        def limits_cli(*arguments, selected=profile, check=True):
+            result = subprocess.run([str(exe), '--data-dir', str(selected), 'cli', 'mcp-limits',
+                                     *map(str, arguments)], env=child_env, capture_output=True,
+                                    text=True, timeout=10)
+            if check:
+                assert result.returncode == 0, (arguments, result.stdout, result.stderr)
+            return result
+
+        def limits_json(*arguments):
+            value = json.loads(limits_cli(*arguments, '--json').stdout)
+            assert value['zero_means_unlimited'] is True
+            assert isinstance(value['saved'], bool) and isinstance(value['restart_required'], bool)
+            assert value['saved'] is bool(arguments)
+            return value['limits']
+
+        # Reads must not migrate/rewrite the file, and updates must preserve
+        # unrelated configuration and untouched individual limits.
+        config.pop('mcp_http_limits', None)
+        saved.write_text(json.dumps(config))
+        before = saved.read_bytes()
+        assert limits_json() == unlimited
+        assert saved.read_bytes() == before, 'reading defaults rewrote the profile'
+        limits_cli('--sessions', 3, '--calls', 2)
+        expected = dict(unlimited, sessions=3, calls=2)
+        assert limits_json() == expected
+        persisted = json.loads(saved.read_text())
+        assert persisted['mcp_http_limits'] == expected
+        for name, value in config.items():
+            if name == 'sessions':
+                assert len(persisted[name]) == len(value)
+                for original, updated in zip(value, persisted[name]):
+                    # ConfigStore intentionally encrypts legacy plaintext secrets
+                    # and may serialize default fields during any successful save.
+                    for field, field_value in original.items():
+                        if field != 'password':
+                            assert updated[field] == field_value, ('session setting changed', field)
+                    assert updated['password'], 'session credential was lost'
+            else:
+                assert persisted[name] == value, ('unrelated profile setting changed', name)
+        assert limits_json('--streams', 4) == dict(expected, streams=4)
+        assert limits_json('--sessions', 0) == dict(expected, sessions=0, streams=4)
+        for name in limit_names:
+            limits_cli('--' + name, 1_000_000)
+            assert limits_json()[name] == 1_000_000
+            for invalid in ('-1', '1000001', '18446744073709551616', '1.5', 'abc'):
+                before = saved.read_bytes()
+                result = limits_cli('--' + name, invalid, check=False)
+                assert result.returncode != 0, (name, invalid, result.stdout)
+                assert saved.read_bytes() == before, ('invalid CLI changed profile', name, invalid)
+        before = saved.read_bytes()
+        assert limits_cli('--sessions', 2, '--calls', '1000001', check=False).returncode != 0
+        assert saved.read_bytes() == before, 'partial invalid update mutated valid field'
+        valid_profile = saved.read_bytes()
+        invalid_settings = [None, [], 'invalid', dict(unlimited, unknown=1)]
+        for name in limit_names:
+            for invalid in (None, -1, 1.5, '2', 1_000_001, 18_446_744_073_709_551_616):
+                invalid_settings.append(dict(unlimited, **{name: invalid}))
+        for invalid in invalid_settings:
+            malformed = dict(config, mcp_http_limits=invalid)
+            saved.write_text(json.dumps(malformed))
+            before = saved.read_bytes()
+            for arguments in (('--json',), ('--sessions', 2, '--json')):
+                result = limits_cli(*arguments, check=False)
+                assert result.returncode != 0, ('malformed profile accepted', invalid, result.stdout)
+                assert saved.read_bytes() == before, ('malformed profile reset or changed', invalid)
+        saved.write_bytes(valid_profile)
+        other_profile = root / 'other-profile'
+        other_profile.mkdir(mode=0o700)
+        other_saved = other_profile / 'sessions.json'
+        other_saved.write_text(json.dumps(dict(config, mcp_http_limits=dict(unlimited, sessions=1))))
+        other_before = other_saved.read_bytes()
+        limits_cli('--sessions', 0, '--requests', 0, '--calls', 0, '--streams', 0)
+        assert other_saved.read_bytes() == other_before
+        print('PASS: limits CLI defaults, partial updates, persistence, bounds, overflow and invalid-input atomicity')
+
+        @contextlib.contextmanager
+        def limits_server(limits=None, extra_env=None, preserve_saved=False):
+            current = dict(config)
+            if limits is not None:
+                current['mcp_http_limits'] = limits
+            else:
+                current.pop('mcp_http_limits', None)
+            if not preserve_saved:
+                saved.write_text(json.dumps(current))
+            with log.open('wb') as output:
+                service = subprocess.Popen(start, stdout=subprocess.DEVNULL, stderr=output,
+                                           env=dict(child_env, **(extra_env or {})))
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    assert service.poll() is None, 'limits service exited: ' + log.read_text()
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), .1):
+                            break
+                    except OSError:
+                        time.sleep(.05)
+                else:
+                    raise AssertionError('limits service not ready')
+                yield
+            finally:
+                service.terminate()
+                try:
+                    service.wait(timeout=12)
+                except subprocess.TimeoutExpired:
+                    service.kill()
+                    service.wait()
+                    raise AssertionError('limits service shutdown exceeded 12 seconds')
+                output = log.read_text()
+                assert alice not in output and bob not in output
+                assert 'synthetic-not-a-real-secret' not in output
+
+        @contextlib.contextmanager
+        def stalled_calls():
+            # Count accepted and closed connections rather than sleeping and
+            # guessing whether the concurrent tool bodies actually started.
+            listener = socket.socket()
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(128)
+            listener.settimeout(.1)
+            state = {'accepted': 0, 'closed': 0}
+            condition = threading.Condition()
+            stop = threading.Event()
+            connections = []
+            def serve(client):
+                try:
+                    while client.recv(8192):
+                        pass
+                except OSError:
+                    pass
+                finally:
+                    client.close()
+                    with condition:
+                        state['closed'] += 1
+                        condition.notify_all()
+            def accept():
+                while not stop.is_set():
+                    try:
+                        client, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    connections.append(client)
+                    with condition:
+                        state['accepted'] += 1
+                        condition.notify_all()
+                    threading.Thread(target=serve, args=(client,), daemon=True).start()
+            worker = threading.Thread(target=accept, daemon=True)
+            worker.start()
+            current = json.loads(saved.read_text())
+            current['sessions'][0].update(port=listener.getsockname()[1], password='synthetic-not-a-real-secret')
+            current['mcp_allow_commands'] = True
+            current['mcp_use_saved_credentials'] = True
+            saved.write_text(json.dumps(current))
+            def wait_count(field, count):
+                with condition:
+                    assert condition.wait_for(lambda: state[field] >= count, timeout=8), (field, count, state)
+            try:
+                yield wait_count
+            finally:
+                stop.set()
+                listener.close()
+                worker.join(timeout=2)
+                for client in connections:
+                    try:
+                        client.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    client.close()
+
+        def pending_call(session, request_id):
+            return call('run_command', dict(session_id='fixture', command='true', timeout_seconds=60),
+                        request_id, session)
+
+        def cancel(session, request_id):
+            assert request(dict(jsonrpc='2.0', method='notifications/cancelled',
+                                params={'requestId': request_id}), alice, session)[0] == 202
+
+        def delete(session):
+            assert request(auth=alice, session=session, method='DELETE')[0] in (200, 202)
+            assert request(listing, alice, session)[0] == 404
+
+        def incomplete_request(session):
+            slow = connection(timeout=10)
+            slow.putrequest('POST', '/mcp')
+            for name, value in {'Authorization': 'Bearer ' + alice, 'Content-Type': 'application/json',
+                                'Accept': 'application/json, text/event-stream', 'Mcp-Session-Id': session,
+                                'MCP-Protocol-Version': args.protocol_version, 'Content-Length': '1000'}.items():
+                slow.putheader(name, value)
+            slow.endheaders()
+            slow.send(b'{')
+            return slow
+
+        # Missing field means unlimited, including past the historical gates.
+        # A conflicting environment profile must not override --data-dir.
+        with limits_server(extra_env={'MEATSHELL_DATA_DIR': str(other_profile)}):
+            sessions = [initialize(alice) for _ in range(70)]
+            with contextlib.ExitStack() as pending:
+                slow_clients = [pending.enter_context(contextlib.closing(incomplete_request(sessions[0])))
+                                for _ in range(36)]
+                assert request(listing, alice, sessions[0])[0] == 200
+                for slow in slow_clients:
+                    response = slow.getresponse()
+                    assert response.status == 408, ('unlimited request admission refused', response.status)
+                    response.read()
+            with stalled_calls() as wait_count, concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+                futures = [pool.submit(pending_call, sessions[i], 1000+i) for i in range(20)]
+                wait_count('accepted', 20)
+                assert not any(f.done() for f in futures), 'unlimited concurrent tool/stream admission refused'
+                for i in range(20):
+                    cancel(sessions[i], 1000+i)
+                for future in futures:
+                    assert future.result(timeout=5)[0] == 200
+                wait_count('closed', 20)
+            for session in sessions:
+                delete(session)
+        print('PASS: missing limits permit 70 sessions, 36 requests and 20 calls/streams; explicit profile wins')
+
+        # Omitted individual values also default to unlimited.
+        with limits_server({'sessions': 2}):
+            first, second = initialize(alice), initialize(bob)
+            assert request(init, alice)[0] == 429
+            # Editing the persisted setting does not change a running service.
+            limits_cli('--sessions', 0)
+            assert request(init, alice)[0] == 429, 'limit changed without restart'
+            delete(first)
+            replacement = initialize(alice)
+            assert request(init, alice)[0] == 429
+            delete(replacement)
+            assert request(auth=bob, session=second, method='DELETE')[0] in (200, 202)
+        with limits_server(preserve_saved=True):
+            sessions = [initialize(alice) for _ in range(3)]
+            for session in sessions:
+                delete(session)
+        print('PASS: finite sessions refuse, release on DELETE, recover; changed limits take effect after restart')
+        # Lowering a persisted limit cannot evict or change a running service;
+        # a restarted service enforces the new, smaller admission capacity.
+        with limits_server(dict(unlimited, sessions=3)):
+            old_sessions = [initialize(alice) for _ in range(3)]
+            limits_cli('--sessions', 1)
+            delete(old_sessions.pop())
+            replacement = initialize(alice)
+            assert request(init, alice)[0] == 429
+            for session in [*old_sessions, replacement]:
+                delete(session)
+        with limits_server(preserve_saved=True):
+            session = initialize(alice)
+            assert request(init, alice)[0] == 429
+            delete(session)
+        print('PASS: lowering saved session capacity applies only after restart')
+
+
+        with limits_server(dict(unlimited, sessions=2)):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                admissions = list(pool.map(lambda _: request(init, alice), range(8)))
+            admitted = [headers['mcp-session-id'] for status, headers, _ in admissions if status == 200]
+            assert len(admitted) == 2, [status for status, _, _ in admissions]
+            assert all(status in (200, 429) for status, _, _ in admissions)
+            for session in admitted:
+                delete(session)
+            replacement = initialize(alice)
+            delete(replacement)
+        print('PASS: concurrent initialize never oversubscribes finite session capacity')
+
+        with limits_server(dict(unlimited, requests=1)):
+            session = initialize(alice)
+            slow = incomplete_request(session)
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    status = request(listing, alice, session)[0]
+                    if status == 429:
+                        break
+                    assert status == 200, status
+                    time.sleep(.02)
+                else:
+                    raise AssertionError('finite request admission never refused')
+                response = slow.getresponse()
+                assert response.status == 408
+                response.read()
+            finally:
+                slow.close()
+            assert request(listing, alice, session)[0] == 200
+            # Invalid bodies also release their request permit.
+            assert request(auth=alice, session=session, raw='{bad')[0] == 400
+            assert request(listing, alice, session)[0] == 200
+            delete(session)
+        print('PASS: finite request gate refuses during slow body and recovers after timeout/error')
+
+        for gate in ('calls', 'streams'):
+            with limits_server(dict(unlimited, **{gate: 1})):
+                session = initialize(alice)
+                with stalled_calls() as wait_count, concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(pending_call, session, 2000)
+                    wait_count('accepted', 1)
+                    assert not future.done()
+                    status, _, value = call('list_sessions', {}, 2001, session)
+                    if gate == 'calls':
+                        assert status == 200 and 'error' in value and 'busy' in json.dumps(value).lower(), (status, value)
+                        assert request(listing, alice, session)[0] == 200
+                    else:
+                        assert status == 429, (status, value)
+                        assert request(listing, alice, session)[0] == 429
+                    # Control messages must remain usable at call/stream capacity.
+                    cancel(session, 2000)
+                    assert future.result(timeout=5)[0] == 200
+                    wait_count('closed', 1)
+                    status, _, value = call('list_sessions', {}, 2002, session)
+                    assert status == 200 and 'result' in value and not value['result'].get('isError'), (status, value)
+                    future = pool.submit(pending_call, session, 2003)
+                    wait_count('accepted', 2)
+                    delete(session)
+                    future.result(timeout=5)
+                    wait_count('closed', 2)
+                    replacement = initialize(alice)
+                    assert call('list_sessions', {}, 2004, replacement)[0] == 200
+                    delete(replacement)
+            print(f'PASS: finite {gate} refusal, cancellation/DELETE under load, permit recovery')
+
 
 if __name__ == '__main__':
     main()

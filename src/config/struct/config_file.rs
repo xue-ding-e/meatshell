@@ -74,6 +74,70 @@ pub(crate) fn default_quick_panel_height() -> f32 {
     220.0
 }
 
+/// HTTP MCP admission limits. Zero means unlimited; changes apply on restart.
+/// A portable bound stays below Tokio's semaphore maximum on 32-bit targets.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpHttpLimits {
+    #[serde(deserialize_with = "deserialize_mcp_limit")]
+    pub sessions: u32,
+    #[serde(deserialize_with = "deserialize_mcp_limit")]
+    pub requests: u32,
+    #[serde(deserialize_with = "deserialize_mcp_limit")]
+    pub calls: u32,
+    #[serde(deserialize_with = "deserialize_mcp_limit")]
+    pub streams: u32,
+}
+
+impl McpHttpLimits {
+    pub const MAX: u32 = 1_000_000;
+
+    pub fn validate(self) -> anyhow::Result<()> {
+        for (name, value) in [("sessions", self.sessions), ("requests", self.requests),
+            ("calls", self.calls), ("streams", self.streams)] {
+            anyhow::ensure!(value <= Self::MAX, "{name} must be an integer from 0 to {} (0 = unlimited)", Self::MAX);
+        }
+        Ok(())
+    }
+
+    /// Shared by the desktop and CLI. Do not silently clamp or truncate input.
+    pub fn parse_inputs(sessions: &str, requests: &str, calls: &str, streams: &str) -> anyhow::Result<Self> {
+        fn parse(name: &str, text: &str) -> anyhow::Result<u32> {
+            anyhow::ensure!(!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()),
+                "{name} must be an integer from 0 to {} (0 = unlimited)", McpHttpLimits::MAX);
+            text.parse::<u32>().map_err(|_| anyhow::anyhow!("{name} must be an integer from 0 to {} (0 = unlimited)", McpHttpLimits::MAX))
+        }
+        let value = Self { sessions: parse("sessions", sessions)?, requests: parse("requests", requests)?,
+            calls: parse("calls", calls)?, streams: parse("streams", streams)? };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+// Require the profile field to be a JSON object. Serde's derived struct
+// visitor also accepts sequences; an empty array must not silently mean zero.
+fn deserialize_mcp_http_limits<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<McpHttpLimits, D::Error> {
+    struct LimitsVisitor;
+    impl<'de> serde::de::Visitor<'de> for LimitsVisitor {
+        type Value = McpHttpLimits;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an object containing HTTP MCP limits")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            McpHttpLimits::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(LimitsVisitor)
+}
+
+fn deserialize_mcp_limit<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = u32::deserialize(deserializer)?;
+    if value > McpHttpLimits::MAX {
+        return Err(serde::de::Error::custom(format!("MCP limit must be from 0 to {} (0 = unlimited)", McpHttpLimits::MAX)));
+    }
+    Ok(value)
+}
+
 /// On-disk layout. Keep additive to ease forward-compat.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -296,6 +360,9 @@ pub struct ConfigFile {
     /// Allow MCP clients to upload local files and download remote files.
     #[serde(default = "default_mcp_preview_enabled")]
     pub mcp_allow_file_transfers: bool,
+    /// Per-profile authenticated HTTP limits; missing fields are unlimited.
+    #[serde(default, deserialize_with = "deserialize_mcp_http_limits")]
+    pub mcp_http_limits: McpHttpLimits,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
     /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
@@ -322,4 +389,46 @@ pub(crate) struct ExportFile {
     /// Format marker / version so the schema can evolve later.
     pub(crate) meatshell_export: u32,
     pub(crate) sessions: Vec<Session>,
+}
+
+#[cfg(test)]
+mod mcp_limits_tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_partial_limits_are_unlimited() {
+        let config: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.mcp_http_limits, McpHttpLimits::default());
+        let limits: McpHttpLimits = serde_json::from_str(r#"{"calls":3}"#).unwrap();
+        assert_eq!(limits, McpHttpLimits { calls: 3, ..Default::default() });
+        assert_eq!(serde_json::from_str::<McpHttpLimits>("{}").unwrap(), McpHttpLimits::default());
+    }
+
+    #[test]
+    fn limits_reject_invalid_json_without_coercion() {
+        for value in ["null", "-1", "0.5", "1.0", "true", "\"1\"", "1000001", "4294967296", "18446744073709551616"] {
+            for field in ["sessions", "requests", "calls", "streams"] {
+                let raw = format!(r#"{{"{field}":{value}}}"#);
+                assert!(serde_json::from_str::<McpHttpLimits>(&raw).is_err(), "accepted {raw}");
+            }
+        }
+        assert!(serde_json::from_str::<McpHttpLimits>(r#"{"call":1}"#).is_err());
+        for value in ["null", "[]", "[1,2,3,4]", "\"invalid\""] {
+            assert!(serde_json::from_str::<ConfigFile>(&format!(r#"{{"mcp_http_limits":{value}}}"#)).is_err());
+        }
+        assert!(serde_json::from_str::<ConfigFile>(r#"{"mcp_http_limits":{"calls":1,"calls":2}}"#).is_err());
+    }
+
+    #[test]
+    fn shared_input_parser_checks_range_and_overflow() {
+        for invalid in ["", " ", " 1", "1 ", "+1", "-1", "1.0", "1e2", "NaN", "1000001", "4294967296", "18446744073709551616", "１"] {
+            assert!(McpHttpLimits::parse_inputs(invalid, "0", "0", "0").is_err(), "accepted {invalid}");
+            assert!(McpHttpLimits::parse_inputs("0", invalid, "0", "0").is_err());
+            assert!(McpHttpLimits::parse_inputs("0", "0", invalid, "0").is_err());
+            assert!(McpHttpLimits::parse_inputs("0", "0", "0", invalid).is_err());
+        }
+        let limits = McpHttpLimits::parse_inputs("0", "1", "0002", "1000000").unwrap();
+        assert_eq!(limits, McpHttpLimits { sessions: 0, requests: 1, calls: 2, streams: McpHttpLimits::MAX });
+        assert_eq!(serde_json::from_str::<McpHttpLimits>(&serde_json::to_string(&limits).unwrap()).unwrap(), limits);
+    }
 }

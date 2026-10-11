@@ -681,7 +681,15 @@ export component AppWindow inherits Window {
     in-out property <bool> mcp-use-saved-credentials: true;
     in-out property <bool> mcp-allow-commands: true;
     in-out property <bool> mcp-allow-file-transfers: true;
+    // Keep edits as text until Save so invalid input never mutates settings.
+    in-out property <string> mcp-http-sessions: "0";
+    in-out property <string> mcp-http-requests: "0";
+    in-out property <string> mcp-http-calls: "0";
+    in-out property <string> mcp-http-streams: "0";
+    in-out property <string> mcp-http-limits-status;
+    in-out property <bool> mcp-http-limits-error: false;
     callback set-mcp-permissions(bool, bool, bool, bool);
+    callback save-mcp-http-limits(string, string, string, string);
     callback add-wsl-profile(string, string, string);
     callback remove-wsl-profile(string);
     callback pick-wsl-directory();
@@ -5200,6 +5208,12 @@ export component AppWindow inherits Window {
                     mcp-use-saved-credentials <=> root.mcp-use-saved-credentials;
                     mcp-allow-commands <=> root.mcp-allow-commands;
                     mcp-allow-file-transfers <=> root.mcp-allow-file-transfers;
+                    mcp-http-sessions <=> root.mcp-http-sessions;
+                    mcp-http-requests <=> root.mcp-http-requests;
+                    mcp-http-calls <=> root.mcp-http-calls;
+                    mcp-http-streams <=> root.mcp-http-streams;
+                    mcp-http-limits-status <=> root.mcp-http-limits-status;
+                    mcp-http-limits-error <=> root.mcp-http-limits-error;
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
@@ -5259,6 +5273,9 @@ export component AppWindow inherits Window {
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
                     set-mcp-permissions(enabled, credentials, commands, files) => {
                         root.set-mcp-permissions(enabled, credentials, commands, files);
+                    }
+                    save-mcp-http-limits(sessions, requests, calls, streams) => {
+                        root.save-mcp-http-limits(sessions, requests, calls, streams);
                     }
                     add-wsl-profile(name, distribution, directory) => { root.add-wsl-profile(name, distribution, directory); }
                     remove-wsl-profile(id) => { root.remove-wsl-profile(id); }

@@ -401,6 +401,13 @@ export component InterfacePanel inherits Rectangle {
     in-out property <bool> mcp-use-saved-credentials: true;
     in-out property <bool> mcp-allow-commands: true;
     in-out property <bool> mcp-allow-file-transfers: true;
+    // Keep edits as text until Save so invalid input never mutates settings.
+    in-out property <string> mcp-http-sessions: "0";
+    in-out property <string> mcp-http-requests: "0";
+    in-out property <string> mcp-http-calls: "0";
+    in-out property <string> mcp-http-streams: "0";
+    in-out property <string> mcp-http-limits-status;
+    in-out property <bool> mcp-http-limits-error: false;
     in-out property <float> wallpaper-overlay;   // frosted-panel opacity 0.30-1.00
     // Active wallpaper id: "" / "builtin:light" / "builtin:dark" / a file path.
     in property <string> current-wallpaper;
@@ -455,6 +462,7 @@ export component InterfacePanel inherits Rectangle {
     callback set-quick-commands-as-sidebar(bool);
     callback set-update-check-enabled(bool);   // startup new-version check (#184)
     callback set-mcp-permissions(bool, bool, bool, bool);
+    callback save-mcp-http-limits(string, string, string, string);
     callback persist-wallpaper-overlay(float);   // save the overlay opacity
     callback set-wallpaper(string);    // none / builtin selection
     callback pick-wallpaper-file();    // open the OS file dialog (Rust)
@@ -1695,6 +1703,56 @@ export component InterfacePanel inherits Rectangle {
                             root.mcp-allow-file-transfers = v;
                             root.set-mcp-permissions(root.mcp-enabled, root.mcp-use-saved-credentials, root.mcp-allow-commands, v);
                         }
+                    }
+                }
+                Rectangle { height: 18px; }
+                SectionHeader { text: root.lang-en ? "HTTP CONCURRENCY LIMITS" : "HTTP 并发限制"; height: 24px; }
+                Text {
+                    text: root.lang-en
+                        ? "Enter integers from 0 to 1000000. 0 means unlimited (default). Limits apply across all HTTP sessions in this service process. Save, then restart the MCP HTTP service to apply."
+                        : "请输入 0 至 1000000 的整数。0 表示不限（默认值），限制适用于该服务进程的全部 HTTP 会话。保存后需重启 MCP HTTP 服务才能生效。";
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.panel-font;
+                    wrap: word-wrap;
+                }
+                VerticalLayout {
+                    spacing: 10px;
+                    padding-top: 10px;
+                    LabeledInput {
+                        label: root.lang-en ? "HTTP sessions" : "HTTP 会话数";
+                        value <=> root.mcp-http-sessions;
+                        placeholder: "0";
+                    }
+                    LabeledInput {
+                        label: root.lang-en ? "Concurrent HTTP requests" : "并发 HTTP 请求数";
+                        value <=> root.mcp-http-requests;
+                        placeholder: "0";
+                    }
+                    LabeledInput {
+                        label: root.lang-en ? "Concurrent tool calls" : "并发工具调用数";
+                        value <=> root.mcp-http-calls;
+                        placeholder: "0";
+                    }
+                    LabeledInput {
+                        label: root.lang-en ? "Concurrent response streams" : "并发响应流数";
+                        value <=> root.mcp-http-streams;
+                        placeholder: "0";
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        PrimaryButton {
+                            text: root.lang-en ? "Save HTTP limits" : "保存 HTTP 限制";
+                            clicked => {
+                                root.save-mcp-http-limits(root.mcp-http-sessions, root.mcp-http-requests,
+                                    root.mcp-http-calls, root.mcp-http-streams);
+                            }
+                        }
+                    }
+                    if root.mcp-http-limits-status != "" : Text {
+                        text: root.mcp-http-limits-status;
+                        color: root.mcp-http-limits-error ? Theme.danger : Theme.success;
+                        font-size: 11px * Theme.panel-font;
+                        wrap: word-wrap;
                     }
                 }
                 Rectangle { height: 18px; }

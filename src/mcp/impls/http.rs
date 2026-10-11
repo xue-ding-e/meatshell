@@ -27,12 +27,22 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit, TryAcquireError};
 use tokio_util::sync::CancellationToken;
 
 const MAX_BODY: usize = 1024 * 1024;
 const SESSION_TTL: u64 = 15 * 60;
-const MAX_SESSIONS: usize = 64;
+/// None deliberately bypasses admission, rather than constructing Semaphore(0).
+#[derive(Clone)]
+struct Admission(Option<Arc<Semaphore>>);
+impl Admission {
+    fn new(limit: u32) -> Self {
+        Self((limit != 0).then(|| Arc::new(Semaphore::new(limit as usize))))
+    }
+    fn try_acquire(&self) -> std::result::Result<Option<OwnedSemaphorePermit>, TryAcquireError> {
+        self.0.as_ref().map(|semaphore| semaphore.clone().try_acquire_owned()).transpose()
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,15 +75,16 @@ struct Boundary {
     owners: Mutex<HashMap<String, SessionOwner>>,
     initialize_lock: Mutex<()>,
     sessions: Arc<LocalSessionManager>,
-    requests: Semaphore,
-    streams: Arc<Semaphore>,
+    max_sessions: u32,
+    requests: Admission,
+    streams: Admission,
 }
 
 #[derive(Clone)]
 struct HttpTools {
     allow_config_import: bool,
     scope: String,
-    calls: Arc<Semaphore>,
+    calls: Admission,
 }
 
 // Preserve provider-specific descriptor fields that rmcp 2.2's typed Tool
@@ -168,8 +179,7 @@ impl ServerHandler for HttpTools {
         }
         let _permit = self
             .calls
-            .clone()
-            .try_acquire_owned()
+            .try_acquire()
             .map_err(|_| ErrorData::internal_error("server busy; retry later", None))?;
         let args = Value::Object(request.arguments.unwrap_or_default());
         let result = tokio::select! {
@@ -313,8 +323,8 @@ async fn guard(State(state): State<Arc<Boundary>>, request: Request, next: Next)
     // Hold through the full response body, while notifications/DELETE retain
     // separate admission capacity to cancel work under load.
     let stream_permit = if has_id {
-        match state.streams.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
+        match state.streams.try_acquire() {
+            Ok(permit) => permit,
             Err(_) => {
                 return failure(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -338,7 +348,8 @@ async fn guard(State(state): State<Arc<Boundary>>, request: Request, next: Next)
             return failure(StatusCode::BAD_REQUEST, "initialize first");
         }
         let lock = state.initialize_lock.lock().await;
-        if state.sessions.sessions.read().await.len() >= MAX_SESSIONS {
+        if state.max_sessions != 0
+            && state.sessions.sessions.read().await.len() >= state.max_sessions as usize {
             return failure(
                 StatusCode::TOO_MANY_REQUESTS,
                 "session limit reached; retry after closing a session",
@@ -436,6 +447,10 @@ pub(super) fn run(path: &str, allow_config_import: bool) -> Result<()> {
     let config: HttpConfig =
         serde_json::from_slice(&std::fs::read(path).context("read HTTP config")?)
             .context("parse HTTP config")?;
+    // The selected profile is the only limits source for GUI and CLI alike.
+    // Capture once so saving settings cannot change active admission semantics.
+    let limits = crate::config::ConfigStore::load()?.mcp_http_limits();
+    limits.validate()?;
     let base = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
     let oauth = OAuth::load(config.oauth, base)?;
     let resource = oauth::https_url(&oauth.config.resource)?;
@@ -460,9 +475,9 @@ pub(super) fn run(path: &str, allow_config_import: bool) -> Result<()> {
         manager.session_config.completed_cache_ttl = Duration::ZERO;
         let sessions = Arc::new(manager);
         let state = Arc::new(Boundary { oauth, origins: config.allowed_origins, owners: Mutex::new(HashMap::new()),
-            initialize_lock: Mutex::new(()), sessions: sessions.clone(), requests: Semaphore::new(32), streams: Arc::new(Semaphore::new(16)) });
+            initialize_lock: Mutex::new(()), sessions: sessions.clone(), max_sessions: limits.sessions, requests: Admission::new(limits.requests), streams: Admission::new(limits.streams) });
         let shutdown = CancellationToken::new();
-        let tools = HttpTools { allow_config_import, scope: state.oauth.config.required_scope.clone(), calls: Arc::new(Semaphore::new(16)) };
+        let tools = HttpTools { allow_config_import, scope: state.oauth.config.required_scope.clone(), calls: Admission::new(limits.calls) };
         let service = StreamableHttpService::new(move || Ok(HttpService(tools.clone())), sessions,
             StreamableHttpServerConfig::default().with_allowed_hosts([public_authority, config.bind.to_string()])
                 .with_cancellation_token(shutdown.child_token()));
@@ -500,4 +515,92 @@ pub(super) fn run(path: &str, allow_config_import: bool) -> Result<()> {
         cleanup(&state, true).await;
         result.context("serve authenticated MCP")
     })
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn zero_bypasses_semaphore_instead_of_rejecting_everything() {
+        let gate = Admission::new(0);
+        assert!(gate.0.is_none());
+        let permits: Vec<_> = (0..1024).map(|_| gate.try_acquire().unwrap()).collect();
+        assert!(permits.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn positive_limit_rejects_and_recovers_across_clones() {
+        let gate = Admission::new(2);
+        let clone = gate.clone();
+        let first = gate.try_acquire().unwrap();
+        let second = clone.try_acquire().unwrap();
+        assert!(first.is_some() && second.is_some());
+        assert!(gate.try_acquire().is_err());
+        drop(first);
+        let replacement = clone.try_acquire().unwrap();
+        assert!(gate.try_acquire().is_err());
+        drop((second, replacement));
+        assert_eq!(gate.0.as_ref().unwrap().available_permits(), 2);
+    }
+
+    #[test]
+    fn simultaneous_admission_never_oversubscribes_and_releases_all_permits() {
+        let gate = Admission::new(3);
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let release = Arc::new(std::sync::Barrier::new(33));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let (gate, barrier, release, accepted) =
+                    (gate.clone(), barrier.clone(), release.clone(), accepted.clone());
+                scope.spawn(move || {
+                    let permit = gate.try_acquire();
+                    if permit.is_ok() {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // Every worker retains its result until all attempts finish.
+                    barrier.wait();
+                    release.wait();
+                    drop(permit);
+                });
+            }
+            barrier.wait();
+            let count = accepted.load(std::sync::atomic::Ordering::SeqCst);
+            release.wait();
+            assert_eq!(count, 3);
+        });
+        assert_eq!(gate.0.as_ref().unwrap().available_permits(), 3);
+    }
+
+    #[test]
+    fn configured_maximum_and_independent_restart_snapshots_are_supported() {
+        let maximum = Admission::new(crate::config::McpHttpLimits::MAX);
+        assert_eq!(maximum.0.as_ref().unwrap().available_permits(), 1_000_000);
+        let running = Admission::new(2);
+        let restarted = Admission::new(1);
+        let first = running.try_acquire().unwrap();
+        let second = running.try_acquire().unwrap();
+        let fresh = restarted.try_acquire().unwrap();
+        assert!(running.try_acquire().is_err());
+        assert!(restarted.try_acquire().is_err());
+        drop(fresh);
+        assert!(restarted.try_acquire().is_ok());
+        assert!(running.try_acquire().is_err());
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn task_abort_releases_admission() {
+        let gate = Admission::new(1);
+        let permit = gate.try_acquire().unwrap();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        assert!(gate.try_acquire().is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(gate.try_acquire().unwrap().is_some());
+    }
 }
